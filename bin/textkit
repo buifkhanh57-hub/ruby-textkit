@@ -1,0 +1,14 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require_relative '../lib/textkit'
+
+text = ARGV.join(' ')
+if text.empty?
+  warn 'usage: textkit <some text>'
+  exit 1
+end
+
+puts "words:        #{TextKit.word_count(text)}"
+puts "slug:         #{TextKit.slugify(text)}"
+puts "top words:    #{TextKit.most_common_words(text, 3).map { |w, c| "#{w}(#{c})" }.join(', ')}"
