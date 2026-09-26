@@ -1,0 +1,287 @@
+# frozen_string_literal: true
+
+require 'json'
+require 'csv'
+
+module Wordcraft
+  # Combined analysis report with pluggable renderers.
+  #
+  # A {Report} runs the four analysers once and renders their results as
+  # plain text, Markdown, JSON or CSV. The CSV renderer is strict RFC 4180
+  # quoting via the +csv+ standard library, so values containing commas,
+  # quotes or newlines survive a round-trip through any spreadsheet.
+  #
+  #   report = Wordcraft::Report.new(text, top: 5, format: :markdown)
+  #   puts report.render
+  class Report
+    FORMATS = %w[text markdown json csv].freeze
+
+    attr_reader :text, :options
+
+    # @param text [String] raw text to analyse
+    # @param options [Hash] accepted keys:
+    #   +:title+ [String] report heading
+    #   +:top+ [Integer] number of top words/phrases to include
+    #   +:ngram+ [Integer] phrase size for the frequency section
+    #   +:stopwords+ [Boolean] filter stopwords in the frequency section
+    #   +:format+ [Symbol,String] default render format
+    def initialize(text, options = {})
+      @text = text.to_s
+      @options = { title: 'Wordcraft Text Report', top: 10, ngram: 1,
+                   stopwords: true, format: :text }
+                  .merge(options.transform_keys(&:to_sym))
+      @data = nil
+    end
+
+    # Lazily computed analysis snapshot (also the JSON payload).
+    #
+    # @return [Hash] JSON-safe structure with meta, stats, readability,
+    #   sentiment and frequency sections
+    def data
+      @data ||= build_data
+    end
+
+    # Renders the report in the requested format.
+    #
+    # @param format [Symbol, String, nil] +:text+, +:markdown+, +:json+ or
+    #   +:csv+; defaults to the constructor option
+    # @return [String] fully rendered report
+    # @raise [Wordcraft::UnsupportedFormatError] for unknown formats
+    def render(format = nil)
+      fmt = (format || @options[:format]).to_s.downcase
+      case fmt
+      when 'text' then render_text
+      when 'markdown', 'md' then render_markdown
+      when 'json' then JSON.pretty_generate(data)
+      when 'csv' then render_csv
+      else
+        raise UnsupportedFormatError, "unknown report format: #{format.inspect} (expected one of #{FORMATS.join(', ')})"
+      end
+    end
+
+    private
+
+    def build_data
+      top = @options[:top].to_i
+      ngram = @options[:ngram].to_i
+      stats = TextStats.new(@text)
+      readability = Readability.new(@text)
+      sentiment = Sentiment.new.analyze(@text)
+      frequency = Frequency.new(@text, stopwords: @options[:stopwords])
+
+      {
+        meta: {
+          title: @options[:title],
+          generator: "wordcraft #{VERSION}",
+          characters: stats.characters,
+          words: stats.word_count,
+          sentences: stats.sentence_count,
+          paragraphs: stats.paragraph_count
+        },
+        stats: {
+          unique_words: stats.unique_words,
+          avg_word_length: round2(stats.avg_word_length),
+          avg_sentence_length: round2(stats.avg_sentence_length),
+          lexical_diversity: round2(stats.lexical_diversity),
+          root_ttr: round2(stats.root_ttr),
+          hapax_ratio: round2(stats.hapax_ratio),
+          longest_word: stats.longest_word,
+          longest_sentence: stats.longest_sentence,
+          word_length_histogram: stats.word_length_histogram
+        },
+        readability: {
+          flesch: round2(readability.flesch),
+          flesch_band: Readability.flesch_band(readability.flesch),
+          flesch_kincaid_grade: round2(readability.flesch_kincaid_grade),
+          gunning_fog: round2(readability.gunning_fog),
+          smog: round2(readability.smog),
+          coleman_liau: round2(readability.coleman_liau),
+          ari: round2(readability.ari),
+          consensus_grade: round2(readability.consensus_grade),
+          consensus_band: Readability.grade_band(readability.consensus_grade)
+        },
+        sentiment: {
+          score: sentiment[:score],
+          normalized: sentiment[:normalized],
+          polarity: sentiment[:polarity].to_s,
+          positive_count: sentiment[:positive_count],
+          negative_count: sentiment[:negative_count],
+          top_positive: sentiment[:positive_hits].tally.sort_by { |w, c| [-c, w] }.first(top),
+          top_negative: sentiment[:negative_hits].tally.sort_by { |w, c| [-c, w] }.first(top)
+        },
+        frequency: {
+          total_words: frequency.total_words,
+          unique_words: frequency.unique_words,
+          top_words: frequency.top(top),
+          top_phrases: frequency.phrases(ngram, top)
+        }
+      }
+    end
+
+    # --------------------------------------------------------------
+    # Plain-text renderer
+    # --------------------------------------------------------------
+
+    def render_text
+      out = String.new
+      d = data
+      rule = '=' * 62
+      thin = '-' * 62
+
+      out << rule << "\n"
+      out << d[:meta][:title].to_s << "\n"
+      out << "generated by wordcraft #{VERSION}" << "\n"
+      out << rule << "\n\n"
+
+      out << "OVERVIEW\n" << thin << "\n"
+      pairs = [
+        ['Characters', d[:meta][:characters]],
+        ['Words', d[:meta][:words]],
+        ['Sentences', d[:meta][:sentences]],
+        ['Paragraphs', d[:meta][:paragraphs]],
+        ['Unique words', d[:stats][:unique_words]],
+        ['Avg word length', d[:stats][:avg_word_length]],
+        ['Avg sentence length', d[:stats][:avg_sentence_length]],
+        ['Lexical diversity', d[:stats][:lexical_diversity]]
+      ]
+      pairs.each { |label, value| out << format_line(label, value) }
+      out << "\n"
+
+      out << "READABILITY\n" << thin << "\n"
+      d[:readability].each do |key, value|
+        next if key == :flesch_band || key == :consensus_band
+
+        out << format_line(key.to_s.tr('_', ' '), value)
+      end
+      out << "  Verdict: #{d[:readability][:consensus_band]}\n\n"
+
+      out << "SENTIMENT\n" << thin << "\n"
+      out << format_line('Polarity', d[:sentiment][:polarity])
+      out << format_line('Raw score', d[:sentiment][:score])
+      out << format_line('Normalized', d[:sentiment][:normalized])
+      out << format_line('Positive hits', d[:sentiment][:positive_count])
+      out << format_line('Negative hits', d[:sentiment][:negative_count])
+      out << "\n"
+
+      out << "TOP WORDS\n" << thin << "\n"
+      d[:frequency][:top_words].each_with_index do |(word, count), index|
+        out << format("%3d. %-24s %6d\n", index + 1, word, count)
+      end
+      out << "\n"
+
+      out << "TOP PHRASES (#{@options[:ngram]}-gram)\n" << thin << "\n"
+      d[:frequency][:top_phrases].each_with_index do |(phrase, count), index|
+        out << format("%3d. %-40s %6d\n", index + 1, phrase, count)
+      end
+      out
+    end
+
+    def format_line(label, value)
+      format("  %-24s %s\n", label, display_value(value))
+    end
+
+    # --------------------------------------------------------------
+    # Markdown renderer
+    # --------------------------------------------------------------
+
+    def render_markdown
+      d = data
+      md = String.new
+      md << "# #{d[:meta][:title]}\n\n"
+      md << "_Generated by wordcraft #{VERSION}_\n\n"
+
+      md << "## Overview\n\n"
+      md << "| Metric | Value |\n| --- | ---: |\n"
+      overview_rows(d).each { |label, value| md << "| #{label} | #{display_value(value)} |\n" }
+
+      md << "\n## Readability\n\n"
+      md << "| Formula | Score | Interpretation |\n| --- | ---: | --- |\n"
+      md << "| Flesch Reading Ease | #{d[:readability][:flesch]} | #{d[:readability][:flesch_band]} |\n"
+      md << "| Flesch-Kincaid Grade | #{d[:readability][:flesch_kincaid_grade]} | #{Readability.grade_band(d[:readability][:flesch_kincaid_grade])} |\n"
+      md << "| Gunning Fog | #{d[:readability][:gunning_fog]} | #{Readability.grade_band(d[:readability][:gunning_fog])} |\n"
+      md << "| SMOG | #{d[:readability][:smog]} | #{Readability.grade_band(d[:readability][:smog])} |\n"
+      md << "| Coleman-Liau | #{d[:readability][:coleman_liau]} | #{Readability.grade_band(d[:readability][:coleman_liau])} |\n"
+      md << "| ARI | #{d[:readability][:ari]} | #{Readability.grade_band(d[:readability][:ari])} |\n"
+
+      md << "\n## Sentiment\n\n"
+      md << "| Metric | Value |\n| --- | ---: |\n"
+      md << "| Polarity | #{d[:sentiment][:polarity]} |\n"
+      md << "| Raw score | #{d[:sentiment][:score]} |\n"
+      md << "| Normalized | #{d[:sentiment][:normalized]} |\n"
+      md << "| Positive hits | #{d[:sentiment][:positive_count]} |\n"
+      md << "| Negative hits | #{d[:sentiment][:negative_count]} |\n"
+
+      md << "\n## Top words\n\n"
+      md << "| Rank | Word | Count |\n| ---: | --- | ---: |\n"
+      d[:frequency][:top_words].each_with_index do |(word, count), index|
+        md << "| #{index + 1} | #{word} | #{count} |\n"
+      end
+
+      md << "\n## Top phrases (#{@options[:ngram]}-gram)\n\n"
+      md << "| Rank | Phrase | Count |\n| ---: | --- | ---: |\n"
+      d[:frequency][:top_phrases].each_with_index do |(phrase, count), index|
+        md << "| #{index + 1} | #{phrase} | #{count} |\n"
+      end
+      md
+    end
+
+    def overview_rows(d)
+      [
+        ['Characters', d[:meta][:characters]],
+        ['Words', d[:meta][:words]],
+        ['Sentences', d[:meta][:sentences]],
+        ['Paragraphs', d[:meta][:paragraphs]],
+        ['Unique words', d[:stats][:unique_words]],
+        ['Avg word length', d[:stats][:avg_word_length]],
+        ['Avg sentence length', d[:stats][:avg_sentence_length]],
+        ['Lexical diversity', d[:stats][:lexical_diversity]],
+        ['Consensus grade band', d[:readability][:consensus_band]]
+      ]
+    end
+
+    # --------------------------------------------------------------
+    # CSV renderer (RFC 4180 quoting via the csv stdlib)
+    # --------------------------------------------------------------
+
+    def render_csv
+      CSV.generate do |csv|
+        csv << ['section', 'key', 'value']
+        flatten_data(data).each do |section, key, value|
+          csv << [section, key, value]
+        end
+      end
+    end
+
+    # Flattens the report data into [section, key, value] triples; lists and
+    # hashes are serialised as JSON fragments so they stay CSV-safe.
+    def flatten_data(hash, section = nil)
+      rows = []
+      hash.each do |key, value|
+        full_key = section ? "#{section}.#{key}" : key.to_s
+        case value
+        when Hash
+          rows.concat(flatten_data(value, full_key))
+        when Array
+          rows << [section.to_s, full_key, JSON.generate(value)]
+        else
+          rows << [section.to_s, full_key, value.nil? ? '' : value.to_s]
+        end
+      end
+      rows
+    end
+
+    def display_value(value)
+      case value
+      when nil then 'n/a'
+      when Float then format('%.2f', value)
+      when Hash then value.map { |k, v| "#{k}:#{v}" }.join(' ')
+      when Array then value.map(&:to_s).join(', ')
+      else value.to_s
+      end
+    end
+
+    def round2(value)
+      value.is_a?(Float) ? value.round(2) : value
+    end
+  end
+end

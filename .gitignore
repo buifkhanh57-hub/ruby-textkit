@@ -1,0 +1,16 @@
+# Build artifacts
+*.gem
+pkg/
+coverage/
+
+# Ruby tooling
+.bundle/
+.rspec_status
+.ruby-version
+.ruby-gemset
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
